@@ -38,13 +38,19 @@ class VideoThread(QThread):
         
         # Для подсчета FPS
         self.frame_count = 0
-        self.fps = 0
+        self.display_fps = 0
         self.last_time = time.time()
+        
+        # Для управления частотой кадров
+        self.original_fps = 30  # Значение по умолчанию
+        self.frame_duration = 1.0 / 30.0  # Длительность кадра в секундах
+        self.last_frame_time = time.time()
         
         # Трекер
         self.tracker = None
         self.use_tracking = True
         self.tracker_type = "simple"
+        self.detection_enabled = True
         
     def set_source(self, source_type: str, path=None):
         self.source_type = source_type
@@ -52,6 +58,10 @@ class VideoThread(QThread):
         
     def set_plugin(self, plugin: BaseDetectionPlugin):
         self.plugin = plugin
+        
+    def enable_detection(self, enable: bool):
+        """Включить/выключить детекцию объектов"""
+        self.detection_enabled = enable
         
     def enable_tracking(self, enable: bool, tracker_type: str = "simple"):
         """Включение/выключение трекинга"""
@@ -78,6 +88,7 @@ class VideoThread(QThread):
     def resume(self):
         self.mutex.lock()
         self.paused = False
+        self.last_frame_time = time.time()  # Сбрасываем время при возобновлении
         self.mutex.unlock()
         
     def stop(self):
@@ -107,6 +118,26 @@ class VideoThread(QThread):
         padded[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
         
         return padded, (x_offset, y_offset, new_w, new_h, scale)
+    
+    def get_video_fps(self, cap: cv2.VideoCapture) -> float:
+        """Получение оригинального FPS видео"""
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if fps > 0 and fps < 1000:  # Проверка на корректность
+                return fps
+        except:
+            pass
+        return 30.0  # Значение по умолчанию
+    
+    def get_video_total_frames(self, cap: cv2.VideoCapture) -> int:
+        """Получение общего количества кадров в видео"""
+        try:
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if total_frames > 0:
+                return total_frames
+        except:
+            pass
+        return 0
         
     def run(self):
         self.running = True
@@ -115,8 +146,15 @@ class VideoThread(QThread):
         
         if self.source_type == 'camera':
             self.cap = cv2.VideoCapture(self.source_path)
+            # Для камеры используем стандартные 30 FPS
+            self.original_fps = 30
+            self.frame_duration = 1.0 / self.original_fps
         elif self.source_type == 'video':
             self.cap = cv2.VideoCapture(self.source_path)
+            # Получаем оригинальный FPS видео
+            self.original_fps = self.get_video_fps(self.cap)
+            self.frame_duration = 1.0 / self.original_fps
+            print(f"Оригинальный FPS видео: {self.original_fps:.2f}")
         else:
             self.error_occurred.emit("Неизвестный тип источника")
             return
@@ -124,44 +162,68 @@ class VideoThread(QThread):
         if not self.cap.isOpened():
             self.error_occurred.emit("Не удалось открыть источник видео")
             return
-            
+        
+        # Сбрасываем время последнего кадра
+        self.last_frame_time = time.time()
+        
         while self.running:
             self.mutex.lock()
             paused = self.paused
             self.mutex.unlock()
             
             if paused:
-                self.msleep(100)
+                self.msleep(10)
                 continue
-                
+            
+            # Контроль времени для сохранения оригинального FPS
+            current_time = time.time()
+            time_since_last_frame = current_time - self.last_frame_time
+            
+            if time_since_last_frame < self.frame_duration:
+                # Слишком рано для следующего кадра, ждем
+                sleep_time = (self.frame_duration - time_since_last_frame) * 1000
+                if sleep_time > 0:
+                    self.msleep(int(sleep_time))
+                continue
+            
+            # Читаем следующий кадр
             ret, frame = self.cap.read()
             if not ret:
                 if self.source_type == 'video':
                     self.error_occurred.emit("Видео закончилось")
                     break
                 else:
+                    # Для камеры просто ждем следующий кадр
                     self.msleep(10)
                     continue
             
-            # Подсчет FPS
+            # Обновляем время последнего кадра
+            self.last_frame_time = time.time()
+            
+            # Подсчет отображаемого FPS
             self.frame_count += 1
             current_time = time.time()
             if current_time - self.last_time >= 1.0:
-                self.fps = self.frame_count
+                self.display_fps = self.frame_count
                 self.frame_count = 0
                 self.last_time = current_time
+                # print(f"Отображаемый FPS: {self.display_fps:.1f} (оригинальный: {self.original_fps:.1f})")
             
-            # Сохраняем оригинальный размер
-            original_frame = frame.copy()
-            h_orig, w_orig = original_frame.shape[:2]
-            
-            # Изменяем размер для детекции
-            processed_frame, (x_offset, y_offset, new_w, new_h, scale) = self.resize_with_padding(original_frame, self.resize_size)
-            
-            # Обнаружение объектов
             detections = []
-            if self.plugin and self.plugin.is_loaded():
+            
+            # Выполняем детекцию только если она включена и модель загружена
+            if self.detection_enabled and self.plugin and self.plugin.is_loaded():
+                # Сохраняем оригинальный размер
+                original_frame = frame.copy()
+                h_orig, w_orig = original_frame.shape[:2]
+                
+                # Изменяем размер для детекции
+                processed_frame, (x_offset, y_offset, new_w, new_h, scale) = self.resize_with_padding(original_frame, self.resize_size)
+                
+                # Замер времени обработки
+                detection_start = time.time()
                 raw_detections = self.plugin.detect(processed_frame)
+                detection_time = time.time() - detection_start
                 
                 # Конвертируем в формат для трекера и корректируем координаты
                 detections_for_tracker = []
@@ -211,9 +273,8 @@ class VideoThread(QThread):
                     if self.use_tracking and self.tracker:
                         self.tracker.update([])
             
-            # Передаем кадр с детекциями
-            self.frame_processed.emit(original_frame, detections, self.fps)
-            self.msleep(1)
+            # Передаем кадр с детекциями (или пустым списком, если детекция выключена)
+            self.frame_processed.emit(frame, detections, self.display_fps)
             
         if self.cap:
             self.cap.release()
@@ -273,11 +334,13 @@ class VideoControlWidget(QWidget):
     stop_clicked = pyqtSignal()
     tracking_toggled = pyqtSignal(bool)
     tracker_type_changed = pyqtSignal(str)
+    detection_toggled = pyqtSignal(bool)  # Новый сигнал для детекции
     
     def __init__(self):
         super().__init__()
         self.is_playing = False
         self.use_tracking = True
+        self.use_detection = True  # Флаг использования детекции
         self.init_ui()
         
     def init_ui(self):
@@ -290,28 +353,35 @@ class VideoControlWidget(QWidget):
         self.stop_btn = QPushButton("⏹ Сброс")
         self.stop_btn.clicked.connect(self.stop_clicked)
         
+        layout.addWidget(self.play_pause_btn)
+        layout.addWidget(self.stop_btn)
+        layout.addWidget(QLabel("  |  "))
+        
+        # Кнопка для включения/выключения детекции
+        self.detection_checkbox = QCheckBox("Обнаружение объектов")
+        self.detection_checkbox.setChecked(True)
+        self.detection_checkbox.toggled.connect(self.on_detection_toggled)
+        layout.addWidget(self.detection_checkbox)
+        
         # Чекбокс для включения/выключения трекинга
         self.tracking_checkbox = QCheckBox("Отслеживание объектов")
         self.tracking_checkbox.setChecked(True)
         self.tracking_checkbox.toggled.connect(self.on_tracking_toggled)
+        layout.addWidget(self.tracking_checkbox)
         
         # Выбор типа трекера
         self.tracker_type_combo = QComboBox()
         self.tracker_type_combo.addItems(["Simple (IOU)", "Advanced (Hungarian)"])
         self.tracker_type_combo.currentTextChanged.connect(self.on_tracker_type_changed)
         self.tracker_type_combo.setEnabled(True)
+        layout.addWidget(QLabel("Тип трекера:"))
+        layout.addWidget(self.tracker_type_combo)
+        
+        layout.addStretch()
         
         # Метка для отображения FPS
         self.fps_label = QLabel("FPS: 0")
         self.fps_label.setStyleSheet("font-weight: bold; color: #00ff00; background-color: rgba(0,0,0,0.7); padding: 2px 5px; border-radius: 3px;")
-        
-        layout.addWidget(self.play_pause_btn)
-        layout.addWidget(self.stop_btn)
-        layout.addWidget(QLabel("  |  "))
-        layout.addWidget(self.tracking_checkbox)
-        layout.addWidget(QLabel("Тип трекера:"))
-        layout.addWidget(self.tracker_type_combo)
-        layout.addStretch()
         layout.addWidget(self.fps_label)
         
         self.setLayout(layout)
@@ -319,6 +389,27 @@ class VideoControlWidget(QWidget):
     def on_play_pause_clicked(self):
         """Обработчик нажатия кнопки Старт/Пауза"""
         self.play_pause_clicked.emit()
+    
+    def on_detection_toggled(self, checked: bool):
+        """Обработчик переключения детекции"""
+        self.use_detection = checked
+        self.tracking_checkbox.setEnabled(checked)  # Трекинг доступен только при включенной детекции
+        self.tracker_type_combo.setEnabled(checked and self.use_tracking)
+        self.detection_toggled.emit(checked)
+        
+        if not checked:
+            # Если детекция выключена, выключаем и трекинг
+            self.tracking_checkbox.setChecked(False)
+    
+    def on_tracking_toggled(self, checked: bool):
+        """Обработчик переключения трекинга"""
+        self.use_tracking = checked
+        self.tracker_type_combo.setEnabled(checked and self.use_detection)
+        self.tracking_toggled.emit(checked)
+        
+    def on_tracker_type_changed(self, text: str):
+        tracker_type = "simple" if "Simple" in text else "advanced"
+        self.tracker_type_changed.emit(tracker_type)
     
     def set_playing(self, playing: bool):
         """Установить состояние воспроизведения"""
@@ -333,15 +424,6 @@ class VideoControlWidget(QWidget):
     def is_playing_state(self) -> bool:
         """Вернуть текущее состояние"""
         return self.is_playing
-    
-    def on_tracking_toggled(self, checked: bool):
-        self.use_tracking = checked
-        self.tracker_type_combo.setEnabled(checked)
-        self.tracking_toggled.emit(checked)
-        
-    def on_tracker_type_changed(self, text: str):
-        tracker_type = "simple" if "Simple" in text else "advanced"
-        self.tracker_type_changed.emit(tracker_type)
     
     def update_fps(self, fps: float):
         self.fps_label.setText(f"FPS: {fps:.1f}")
@@ -818,6 +900,7 @@ class MainWindow(QMainWindow):
         self.video_control_widget.stop_clicked.connect(self.reset_video)
         self.video_control_widget.tracking_toggled.connect(self.on_tracking_toggled)
         self.video_control_widget.tracker_type_changed.connect(self.on_tracker_type_changed)
+        self.video_control_widget.detection_toggled.connect(self.on_detection_toggled)  # Добавить эту строку
         self.video_control_widget.setVisible(False)
         main_layout.addWidget(self.video_control_widget)
         
@@ -883,13 +966,6 @@ class MainWindow(QMainWindow):
         fullscreen_action.setShortcut(QKeySequence("F11"))
         fullscreen_action.triggered.connect(self.toggle_fullscreen)
         view_menu.addAction(fullscreen_action)
-        
-        # Меню "Справка"
-        help_menu = menubar.addMenu("Справка")
-        
-        about_action = QAction("О программе", self)
-        about_action.triggered.connect(self.show_about)
-        help_menu.addAction(about_action)
     
     def find_images_in_folder(self, file_path: str) -> List[str]:
         """
@@ -1115,61 +1191,26 @@ class MainWindow(QMainWindow):
         else:
             self.showFullScreen()
             self.status_label.setText("Полноэкранный режим включен")
-    
-    def show_about(self):
-        """Показать информацию о программе"""
-        about_text = """
-        <h2>Система обнаружения и отслеживания объектов</h2>
-        <p>Версия: 2.0</p>
-        <p>Программа предназначена для обнаружения и отслеживания объектов 
-        в реальном времени с использованием плагинной архитектуры.</p>
-        
-        <h3>Возможности:</h3>
-        <ul>
-        <li>Обнаружение объектов на изображениях, видео и с веб-камеры</li>
-        <li>Автоматическое определение всех изображений в папке</li>
-        <li>Навигация между изображениями в папке</li>
-        <li>Отслеживание объектов с уникальными ID</li>
-        <li>Поддержка плагинов (YOLO, Dummy и др.)</li>
-        <li>Сохранение пропорций изображений</li>
-        <li>Отображение FPS в реальном времени</li>
-        <li>Темная и светлая темы оформления</li>
-        </ul>
-        
-        <h3>Управление:</h3>
-        <ul>
-        <li>F11 - полноэкранный режим</li>
-        <li>Esc - выход из полноэкранного режима</li>
-        </ul>
-        
-        <p>© 2026</p>
-        """
-        
-        QMessageBox.about(self, "О программе", about_text)
         
     def create_toolbar(self):
         """Создание панели инструментов"""
         toolbar = QToolBar()
         toolbar.setMovable(False)
         
-        # Объединенная кнопка для открытия изображений
+        # Кнопка открытия изображений
         open_images_action = QAction("📷 Открыть изображения", self)
         open_images_action.triggered.connect(self.open_images)
         toolbar.addAction(open_images_action)
         
+        # Кнопка открытия видео
         open_video_action = QAction("🎬 Открыть видео", self)
         open_video_action.triggered.connect(self.open_video)
         toolbar.addAction(open_video_action)
         
+        # Кнопка веб-камеры
         camera_action = QAction("📹 Веб-камера", self)
         camera_action.triggered.connect(self.start_camera)
         toolbar.addAction(camera_action)
-        
-        toolbar.addSeparator()
-        
-        stop_action = QAction("⏹ Стоп", self)
-        stop_action.triggered.connect(self.stop_processing)
-        toolbar.addAction(stop_action)
         
         return toolbar
         
@@ -1254,34 +1295,113 @@ class MainWindow(QMainWindow):
             self.update_plugin_info()
     
     def on_plugin_changed(self, index):
+        """Обработчик изменения выбранного плагина"""
         if 0 <= index < len(self.plugins):
             self.current_plugin = self.plugins[index]
             self.update_plugin_info()
-            
-            self.classes_list.clear()
-            if hasattr(self.current_plugin, 'get_available_classes'):
-                classes = self.current_plugin.get_available_classes()
-                for cls in classes[:50]:
-                    self.classes_list.addItem(cls)
+            # Не нужно обновлять классы здесь, так как update_plugin_info вызовет update_classes_list
     
     def update_plugin_info(self):
+        """Обновление информации о плагине"""
         if self.current_plugin:
             info = f"Имя: {self.current_plugin.get_name()}\n"
             info += f"Загружен: {'Да' if self.current_plugin.is_loaded() else 'Нет'}\n"
             info += f"Размер входа: {self.current_plugin.get_required_size()}"
             self.plugin_info.setText(info)
+            
+            # Обновляем список классов после загрузки модели
+            self.update_classes_list()
+
+    def update_classes_list(self):
+        """Обновление списка доступных классов"""
+        self.classes_list.clear()
+        
+        if not self.current_plugin:
+            self.classes_list.addItem("❌ Плагин не выбран")
+            return
+        
+        if not self.current_plugin.is_loaded():
+            self.classes_list.addItem("⚠️ Модель не загружена")
+            self.classes_list.addItem("")
+            self.classes_list.addItem("Нажмите 'Загрузить модель'")
+            self.classes_list.addItem("и выберите файл модели")
+            return
+        
+        # Пытаемся получить список классов
+        classes = []
+        
+        # Способ 1: через get_available_classes (для YOLO)
+        if hasattr(self.current_plugin, 'get_available_classes'):
+            try:
+                classes = self.current_plugin.get_available_classes()
+                if classes:
+                    print(f"✓ Получено {len(classes)} классов через get_available_classes")
+            except Exception as e:
+                print(f"Ошибка при вызове get_available_classes: {e}")
+        
+        # Способ 2: через атрибут _classes
+        if not classes and hasattr(self.current_plugin, '_classes'):
+            try:
+                classes = list(self.current_plugin._classes.values())
+                if classes:
+                    print(f"✓ Получено {len(classes)} классов из _classes")
+            except Exception as e:
+                print(f"Ошибка при доступе к _classes: {e}")
+        
+        # Способ 3: через атрибут names (для ultralytics)
+        if not classes and hasattr(self.current_plugin, 'model'):
+            try:
+                if hasattr(self.current_plugin.model, 'names'):
+                    classes = list(self.current_plugin.model.names.values())
+                    print(f"✓ Получено {len(classes)} классов из model.names")
+                elif hasattr(self.current_plugin.model, 'classes'):
+                    classes = list(self.current_plugin.model.classes)
+                    print(f"✓ Получено {len(classes)} классов из model.classes")
+            except Exception as e:
+                print(f"Ошибка при доступе к model: {e}")
+        
+        # Отображаем классы
+        if classes:
+            self.classes_list.addItem(f"📋 Всего классов: {len(classes)}")
+            self.classes_list.addItem("")
+            
+            # Показываем первые 50 классов
+            for i, cls in enumerate(classes):
+                if isinstance(cls, (int, str)):
+                    self.classes_list.addItem(f"  {i}: {cls}")
+                else:
+                    self.classes_list.addItem(f"  {i}: {str(cls)}")
+            
+        else:
+            self.classes_list.addItem("⚠️ Информация о классах не найдена")
+            self.classes_list.addItem("")
+            self.classes_list.addItem("Это может означать:")
+            self.classes_list.addItem("• Модель не предоставляет список классов")
+            self.classes_list.addItem("• Модель загружена, но классы не определены")
+            self.classes_list.addItem("• Используется кастомная модель")
+            
+            # Для YOLO плагина выводим дополнительную информацию
+            if "YOLO" in self.current_plugin.get_name():
+                self.classes_list.addItem("")
+                self.classes_list.addItem("💡 Для YOLO моделей:")
+                self.classes_list.addItem("  Классы загружаются автоматически")
+                self.classes_list.addItem("  из файла модели или COCO dataset")
     
     def load_model_for_plugin(self):
+        """Загрузка модели для текущего плагина"""
         if not self.current_plugin:
             QMessageBox.warning(self, "Ошибка", "Нет выбранного плагина")
             return
         
+        # Для демо-плагина не нужен файл модели
         if "Dummy" in self.current_plugin.get_name():
             self.current_plugin.load_model()
             self.update_plugin_info()
+            self.update_classes_list()  # Обновляем список классов
             self.status_label.setText("Модель-заглушка загружена")
             return
         
+        # Для реальных плагинов - диалог выбора файла
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Выберите файл модели", "", 
             "Model files (*.pt *.onnx *.weights *.pth);;All files (*.*)"
@@ -1295,6 +1415,7 @@ class MainWindow(QMainWindow):
             
             if success:
                 self.update_plugin_info()
+                self.update_classes_list()  # Обновляем список классов после загрузки
                 self.status_label.setText(f"Модель загружена из {os.path.basename(file_path)}")
                 
                 if hasattr(self.current_plugin, 'set_confidence_threshold'):
@@ -1391,16 +1512,17 @@ class MainWindow(QMainWindow):
         return img_copy
 
     def display_image(self, image: np.ndarray, detections: List[DetectionResult] = None,
-                     original_size: Tuple[int, int] = None, fps: float = None):
+                    original_size: Tuple[int, int] = None, fps: float = None, 
+                    original_fps_text: str = ""):
         padded_image, padding_info = self.resize_with_padding(image, (640, 640))
         
         if detections:
             padded_image = self.draw_detections(padded_image, detections, padding_info)
         
         if fps is not None:
-            fps_text = f"FPS: {fps:.1f}"
+            fps_text = f"FPS: {fps:.1f}{original_fps_text}"
             cv2.putText(padded_image, fps_text, (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
         if len(padded_image.shape) == 3:
             padded_image = cv2.cvtColor(padded_image, cv2.COLOR_BGR2RGB)
@@ -1484,10 +1606,35 @@ class MainWindow(QMainWindow):
         self.image_label.setText("📹 Веб-камера готова\n\nНажмите ▶ Старт для запуска")
 
     def start_video_processing(self):
-        """Запуск обработки видео/камеры (вызывается только по кнопке Старт)"""
-        if not self.current_plugin or not self.current_plugin.is_loaded():
-            QMessageBox.warning(self, "Ошибка", "Сначала загрузите модель")
-            return
+        """Запуск обработки видео/камеры"""
+        # Проверяем, включена ли детекция и загружена ли модель
+        if self.video_control_widget.use_detection:
+            if not self.current_plugin or not self.current_plugin.is_loaded():
+                # Спрашиваем пользователя, хочет ли он продолжить без детекции
+                reply = QMessageBox.question(
+                    self, 
+                    "Модель не загружена",
+                    "Модель обнаружения не загружена.\n\n"
+                    "Вы можете:\n"
+                    "• Продолжить без обнаружения объектов (только просмотр)\n"
+                    "• Загрузить модель сейчас\n\n"
+                    "Продолжить без обнаружения?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                
+                if reply == QMessageBox.Yes:
+                    # Отключаем детекцию
+                    self.video_control_widget.detection_checkbox.setChecked(False)
+                    self.video_control_widget.use_detection = False
+                else:
+                    # Загружаем модель
+                    self.load_model_for_plugin()
+                    if not self.current_plugin or not self.current_plugin.is_loaded():
+                        return
+        else:
+            # Детекция отключена пользователем
+            pass
         
         if not self.video_is_loaded:
             QMessageBox.warning(self, "Ошибка", "Сначала откройте видео или веб-камеру")
@@ -1503,9 +1650,17 @@ class MainWindow(QMainWindow):
         self.video_thread.set_source(self.video_source_type, self.video_file_path)
         self.video_thread.set_plugin(self.current_plugin)
         
-        # Включаем трекинг
-        tracker_type = "simple" if self.video_control_widget.tracker_type_combo.currentText() == "Simple (IOU)" else "advanced"
-        self.video_thread.enable_tracking(True, tracker_type)
+        # Настраиваем детекцию и трекинг
+        self.video_thread.enable_detection(self.video_control_widget.use_detection)
+        
+        if self.video_control_widget.use_detection:
+            tracker_type = "simple" if self.video_control_widget.tracker_type_combo.currentText() == "Simple (IOU)" else "advanced"
+            self.video_thread.enable_tracking(
+                self.video_control_widget.use_tracking, 
+                tracker_type
+            )
+        else:
+            self.video_thread.enable_tracking(False, "simple")
         
         # Подключаем сигналы
         self.video_thread.frame_processed.connect(self.on_video_frame)
@@ -1516,11 +1671,41 @@ class MainWindow(QMainWindow):
         
         self.is_processing_video = True
         
-        # ВАЖНО: Меняем состояние кнопки на "Пауза"
+        # Меняем состояние кнопки на "Пауза"
         self.video_control_widget.set_playing(True)
         
         source_name = "видео" if self.video_source_type == 'video' else "веб-камеры"
-        self.status_label.setText(f"Запущена обработка {source_name} с отслеживанием объектов")
+        if self.video_control_widget.use_detection:
+            self.status_label.setText(f"Запущена обработка {source_name} с обнаружением объектов")
+        else:
+            self.status_label.setText(f"Запущен просмотр {source_name} (без обнаружения)")
+
+    def on_detection_toggled(self, enabled: bool):
+        """Включение/выключение детекции во время воспроизведения"""
+        if self.video_thread:
+            self.video_thread.enable_detection(enabled)
+            
+            # Если детекция включается, но модель не загружена
+            if enabled and (not self.current_plugin or not self.current_plugin.is_loaded()):
+                reply = QMessageBox.question(
+                    self,
+                    "Загрузка модели",
+                    "Для включения обнаружения необходимо загрузить модель.\nЗагрузить модель сейчас?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    self.load_model_for_plugin()
+                    if self.current_plugin and self.current_plugin.is_loaded():
+                        self.video_thread.set_plugin(self.current_plugin)
+                        self.status_label.setText("Обнаружение объектов включено")
+                    else:
+                        self.video_control_widget.detection_checkbox.setChecked(False)
+                        self.status_label.setText("Не удалось загрузить модель. Обнаружение отключено")
+                else:
+                    self.video_control_widget.detection_checkbox.setChecked(False)
+                    self.status_label.setText("Обнаружение объектов отключено")
+            else:
+                self.status_label.setText(f"Обнаружение объектов {'включено' if enabled else 'отключено'}")
 
     def resume_video(self):
         """Возобновить воспроизведение видео"""
@@ -1559,6 +1744,10 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Веб-камера готова. Нажмите ▶ Старт для запуска")
             self.image_label.clear()
             self.image_label.setText("📹 Веб-камера готова\n\nНажмите ▶ Старт для запуска")
+        
+        # Сбрасываем время последнего кадра при следующем запуске
+        if self.video_thread:
+            self.video_thread.last_frame_time = time.time()
 
     def toggle_video_play_pause(self):
         """Переключение паузы/воспроизведения видео"""
@@ -1584,14 +1773,20 @@ class MainWindow(QMainWindow):
         """Обработка кадра из видео"""
         confidence_threshold = self.confidence_slider.value() / 100.0
         filtered_detections = [d for d in detections if d.confidence >= confidence_threshold]
-        self.display_image(frame, filtered_detections, fps=fps)
+        
+        # Если есть видео поток, получаем оригинальный FPS для отображения
+        original_fps_text = ""
+        if self.video_thread and hasattr(self.video_thread, 'original_fps'):
+            original_fps_text = f" (Source: {self.video_thread.original_fps:.1f})"
+        
+        # Отображаем FPS на изображении
+        self.display_image(frame, filtered_detections, fps=fps, original_fps_text=original_fps_text)
         self.video_control_widget.update_fps(fps)
 
     def on_video_error(self, error_msg: str):
         """Обработка ошибки видео"""
         if error_msg == "Видео закончилось":
             QMessageBox.information(self, "Информация", "Воспроизведение видео завершено")
-            # Сбрасываем состояние для возможности повторного запуска
             self.reset_video()
         else:
             QMessageBox.warning(self, "Ошибка", error_msg)

@@ -358,4 +358,11 @@ class YOLOPlugin(BaseDetectionPlugin):
     
     def get_available_classes(self) -> List[str]:
         """Возвращает список доступных классов"""
-        return list(self._classes.values()) if self._classes else []
+        if self._classes:
+            # Если _classes это словарь, возвращаем значения
+            if isinstance(self._classes, dict):
+                return list(self._classes.values())
+            # Если это список, возвращаем как есть
+            elif isinstance(self._classes, list):
+                return self._classes
+        return []
